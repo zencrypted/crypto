@@ -32,4 +32,44 @@ final class KalynaTests: XCTestCase {
         let decrypted = try kalyna.decrypt(block: cipher)
         XCTAssertEqual(decrypted, dataBytes, "Decryption failed")
     }
+    
+    func testKalynaCBC() throws {
+        // Replicates test_dstu7624_cbc_core logic
+        let key = [UInt8](repeating: 0x0F, count: 16) // 128-bit key
+        let iv = [UInt8](repeating: 0xAA, count: 16)  // 128-bit IV
+        let data = [UInt8](repeating: 0xCC, count: 64) // 64 bytes (4 blocks)
+        
+        let kalyna = try Kalyna(key: key, blockSize: .block128)
+        
+        // Encrypt
+        let encrypted = try kalyna.encryptCBC(data: data, iv: iv)
+        XCTAssertEqual(encrypted.count, 64)
+        XCTAssertNotEqual(encrypted, data)
+        
+        // Decrypt
+        let decrypted = try kalyna.decryptCBC(data: encrypted, iv: iv)
+        XCTAssertEqual(decrypted.count, 64)
+        
+        XCTAssertEqual(decrypted, data, "CBC Decryption failed to restore original data")
+    }
+    
+    func testKalynaKW() throws {
+        // Replicates test_dstu7624_kw_core logic
+        // key_len (random) -> used as KEK
+        // data (random 64 bytes) -> treated as IV + KeyData
+        
+        let kek = [UInt8](repeating: 0x05, count: 16)
+        var dataToWrap = [UInt8](0..<64)
+        
+        let kalyna = try Kalyna(key: kek, blockSize: .block128)
+        
+        // Wrap
+        let wrapped = try kalyna.wrap(data: dataToWrap)
+        XCTAssertEqual(wrapped.count, 64)
+        XCTAssertNotEqual(wrapped, dataToWrap)
+        
+        // Unwrap
+        let unwrapped = try kalyna.unwrap(data: wrapped)
+        XCTAssertEqual(unwrapped, dataToWrap, "KW Unwrap failed to restore original data")
+    }
 }

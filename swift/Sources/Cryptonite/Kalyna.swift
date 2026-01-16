@@ -577,6 +577,273 @@ public class Kalyna {
         return uint64ToBytes(state)
     }
     
+    // MARK: - CBC Mode
+    
+    public func encryptCBC(data: [UInt8], iv: [UInt8]) throws -> [UInt8] {
+        guard data.count % blockSize.rawValue == 0 else {
+            throw KalynaError.invalidBlockSize // CBC core expects aligned data
+        }
+        guard iv.count == blockSize.rawValue else {
+            throw KalynaError.invalidIVSize
+        }
+        
+        var output = [UInt8]()
+        var currentIV = iv
+        
+        for i in stride(from: 0, to: data.count, by: blockSize.rawValue) {
+            let block = Array(data[i..<i+blockSize.rawValue])
+            
+            // XOR with IV
+            var xoredBlock = [UInt8](repeating: 0, count: blockSize.rawValue)
+            for j in 0..<blockSize.rawValue {
+                xoredBlock[j] = block[j] ^ currentIV[j]
+            }
+            
+            // Encrypt
+            let encryptedBlock = try encrypt(block: xoredBlock)
+            output.append(contentsOf: encryptedBlock)
+            
+            // Update IV
+            currentIV = encryptedBlock
+        }
+        
+        return output
+    }
+    
+    public func decryptCBC(data: [UInt8], iv: [UInt8]) throws -> [UInt8] {
+        guard data.count % blockSize.rawValue == 0 else {
+            throw KalynaError.invalidBlockSize
+        }
+        guard iv.count == blockSize.rawValue else {
+            throw KalynaError.invalidIVSize
+        }
+        
+        var output = [UInt8]()
+        var previousBlock = iv
+        
+        for i in stride(from: 0, to: data.count, by: blockSize.rawValue) {
+            let block = Array(data[i..<i+blockSize.rawValue])
+            
+            // Decrypt
+            let decryptedBlock = try decrypt(block: block)
+            
+            // XOR with previous ciphertext block (or IV)
+            var plaintextBlock = [UInt8](repeating: 0, count: blockSize.rawValue)
+            for j in 0..<blockSize.rawValue {
+                plaintextBlock[j] = decryptedBlock[j] ^ previousBlock[j]
+            }
+            
+            output.append(contentsOf: plaintextBlock)
+            
+            // Update previous block
+            previousBlock = block
+        }
+        
+        return output
+    }
+    
+    // MARK: - Key Wrap Mode (KW)
+    
+    // Implements DSTU 7624 Generic Key Wrap (similar to RFC 3394 but with Kalyna encryption)
+    // Treats first semi-block of data as standard IV (or integrity check).
+    // Input/Output size is preserved.
+    public func wrap(data: [UInt8]) throws -> [UInt8] {
+        let semiBlockSize = blockSize.rawValue / 2
+        guard data.count % semiBlockSize == 0 else {
+            throw KalynaError.invalidBlockSize
+        }
+        
+        // Prepare buffer (copy of data)
+        // [B | b1 | b2 | ... | bn]
+        // B is the first semi-block.
+        
+        let n = data.count / semiBlockSize
+        // n must be at least 2 (IV + 1 block)? Or loop limits handle it?
+        // C implementation uses `v = (n-1) * 6`
+        // If n=1, v=0. Loop doesn't run. Returns data. Correct.
+        
+        guard n >= 2 else { return data }
+        
+        var buffer = data
+        let v = (n - 1) * 6
+        
+        // We operate on semi-blocks.
+        // Let's use a flat byte array and index carefully.
+        // "B" corresponds to buffer[0..<semiBlockSize]
+        // "b" corresponds to buffer[semiBlockSize...]
+        
+        // Temp swap buffer of one full block (for encryption)
+        // block = [B | bi]
+        
+        for i in 1...v {
+            // Logic:
+            // for j = 1 to n-1:
+            //    B = B ^ t (Wait, C code: XOR is at end?)
+            //    Let's trace C code:
+            //    memcpy(swap, B, ...)
+            //    memcpy(swap+semi, b[0], ...)
+            //    encrypt(swap)
+            //    swap[semi] ^= i (XOR with constant) Note: C XORs `swap[semi]` which is start of RIGHT half.
+            //    B = swap[semi] (Wait, C: `memcpy(B, swap + semi, ...)` -> B takes RIGHT half?)
+            //    shift b... (rotate?)
+            
+            /*
+             C Trace:
+             memcpy(swap, B, semib);
+             memcpy(swap+semib, b, semib); NOTE: b points to current `b`.
+             crypt(swap)
+             swap[semib] ^= i
+             memcpy(B, swap+semib, semib) -> New B is Encrypted Right
+             memcpy(shift, b+semib, ...) -> Shift rest of b left?
+             memcpy(b, shift, ...)
+             memcpy(b+last, swap, semib) -> Encrypted Left goes to end of b?
+             
+             This is a rotation.
+             Essentially:
+             [L, R] = Encrypt(B, b[0])
+             R = R ^ i
+             B = R
+             b = b[1...] + [L]
+             */
+            
+            // Extract L (current B) and R (first chunk of b)
+            // Construct block [L | R]
+            var block = [UInt8](repeating: 0, count: blockSize.rawValue)
+            
+
+            
+            for k in 0..<semiBlockSize {
+                block[k] = buffer[k] // L is at 0
+                block[semiBlockSize + k] = buffer[semiBlockSize + k] // R is at semiBlockSize
+            }
+            
+            // Encrypt
+            let encBlock = try encrypt(block: block) // Result is 128/256/512
+            
+            // New L, New R from encBlock?
+            // C: `swap` is encBlock.
+            // `swap[semib] ^= i`. This modifies Right half of encrypted block.
+            var modifiedRight = Array(encBlock[semiBlockSize..<blockSize.rawValue])
+            
+            // XOR i into modifiedRight. i is `size_t` (uint64/uint32).
+            // XOR into lowest byte? C `swap[semib] ^= i` implies byte XOR if i is small?
+            // Wait, C: `swap[block_size_kw_byte] ^= i;` -> `swap` is uint8_t*.
+            // So it XORs ONLY the first byte of the Right Half.
+            modifiedRight[0] ^= UInt8(i & 0xFF)
+            // And if i > 255? C Code: `swap[block_size_kw_byte] ^= i`. `i` goes up to (n-1)*6.
+            // If message is large, i > 255. `^=` on uint8_t truncates i.
+            // Swift must replicate "XOR with byte check".
+            // Yes, `UInt8(i & 0xFF)`.
+            
+            // New B (L) becomes modifiedRight (Right half of enc).
+            // New b (rest) becomes: b[1...] + [Left half of enc]
+            // We need to shift everything in buffer[semi...] left by semi, and put LeftHalf at end.
+            
+            let newL = Array(encBlock[0..<semiBlockSize])
+            
+            // Update buffer:
+            // 1. Move buffer[2*semi...] to buffer[semi...] (Shift left)
+            for k in 2*semiBlockSize..<buffer.count {
+                buffer[k - semiBlockSize] = buffer[k]
+            }
+            
+            // 2. Put NewL at end
+            let endPos = buffer.count - semiBlockSize
+            for k in 0..<semiBlockSize {
+                buffer[endPos + k] = newL[k]
+            }
+            
+            // 3. Put ModifiedRight at B (buffer[0])
+            for k in 0..<semiBlockSize {
+                buffer[k] = modifiedRight[k]
+            }
+        }
+        
+        return buffer
+    }
+    
+    public func unwrap(data: [UInt8]) throws -> [UInt8] {
+        let semiBlockSize = blockSize.rawValue / 2
+        guard data.count % semiBlockSize == 0 else {
+            throw KalynaError.invalidBlockSize
+        }
+        
+        let n = data.count / semiBlockSize
+        guard n >= 2 else { return data }
+        
+        var buffer = data
+        let v = (n - 1) * 6
+        
+        // Invert loop: i from v down to 1
+        for i in stride(from: v, through: 1, by: -1) {
+            // Inverse Rotation:
+            // Reverse of:
+            //   [L, R] = Encrypt(B, b[0])
+            //   R ^= i
+            //   new B = R
+            //   new b = b[1...] + L
+            
+            // Current State (after step):
+            // B is R (modified)
+            // Last chunk of b is L
+            // b[0...end-1] is old b[1...]
+            
+            // So:
+            // Encrypted_Left = buffer[last_chunk]
+            // Encrypted_Right = buffer[0] (Current B)
+            
+            // 1. Recover R_xor (before XOR with i)
+            var encRight = Array(buffer[0..<semiBlockSize])
+            encRight[0] ^= UInt8(i & 0xFF) // Undoes XOR
+            
+            let encLeft = Array(buffer[buffer.count - semiBlockSize..<buffer.count])
+            
+            // 2. Decrypt block [EncLeft | EncRight]
+            var block = [UInt8](repeating: 0, count: blockSize.rawValue)
+            for k in 0..<semiBlockSize {
+                block[k] = encLeft[k]
+                block[semiBlockSize + k] = encRight[k]
+            }
+            
+            let decBlock = try decrypt(block: block)
+            
+            // 3. Recover original B and b[0]
+            // old B = decBlock Left
+            // old b[0] = decBlock Right
+            
+            let oldB = Array(decBlock[0..<semiBlockSize])
+            let oldb0 = Array(decBlock[semiBlockSize..<blockSize.rawValue])
+            
+            // 4. Updating buffer to previous state:
+            //   B becomes oldB
+            //   b becomes [oldb0] + b[0...end-1] (Shift Right)
+            
+            // Shift buffer[semi ... end-semi] to buffer[2*semi ... end]
+            // We iterate backwards to avoid overwrite
+            // Range to move: semiBlockSize ..< buffer.count - semiBlockSize
+            // Dest: 2*semiBlockSize ..< buffer.count
+            
+            let moveCount = buffer.count - 2*semiBlockSize
+            if moveCount > 0 {
+                for k in stride(from: moveCount - 1, through: 0, by: -1) {
+                    buffer[2*semiBlockSize + k] = buffer[semiBlockSize + k]
+                }
+            }
+            
+            // Place oldb0 at b[0] (buffer[semi])
+            for k in 0..<semiBlockSize {
+                buffer[semiBlockSize + k] = oldb0[k]
+            }
+            
+            // Place oldB at B (buffer[0])
+            for k in 0..<semiBlockSize {
+                buffer[k] = oldB[k]
+            }
+        }
+        
+        return buffer
+    }
+    
     private func bytesToUInt64(_ bytes: [UInt8]) -> [UInt64] {
         var u64s = [UInt64]()
         for i in stride(from: 0, to: bytes.count, by: 8) {
@@ -606,6 +873,7 @@ enum KalynaError: Error {
     case invalidKeySize
     case invalidConfiguration
     case invalidBlockSize
+    case invalidIVSize
 }
 
 struct KalynaMath {
